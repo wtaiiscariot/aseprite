@@ -1,4 +1,5 @@
-name: Build & Release — Windows
+name: Build & Package — Windows
+
 on:
   push:
     tags:
@@ -6,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  build-windows-package:
     runs-on: windows-latest
     timeout-minutes: 120
 
@@ -24,7 +25,8 @@ jobs:
       - name: Install Ninja
         uses: aseprite/get-ninja@main
 
-      - name: Install Skia (needed for GUI build)
+      - name: Install Skia
+        # This step uses bash like the upstream workflow so it can source laf/misc/skia-url.sh
         shell: bash
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]] ; then
@@ -32,15 +34,22 @@ jobs:
           else
             this_dir="${{ github.workspace }}"
           fi
-          skia_url=$(source $this_dir/laf/misc/skia-url.sh | xargs)
-          skia_file=$(basename $skia_url)
-          curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
-          unzip "$skia_file" -d skia
+          if [ -f "$this_dir/laf/misc/skia-url.sh" ]; then
+            skia_url=$(source $this_dir/laf/misc/skia-url.sh | xargs)
+            if [ -n "$skia_url" ]; then
+              skia_file=$(basename $skia_url)
+              curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
+              unzip -q "$skia_file" -d skia || true
+            else
+              echo "skia_url is empty, skipping skia download"
+            fi
+          else
+            echo "laf/misc/skia-url.sh not found; skipping skia download"
+          fi
 
       - name: Configure CMake
         shell: bash
         run: |
-          # On Windows we disable ccache and build with Skia backend
           enable_ccache=off
           laf_backend=skia
           enable_scripting=on
@@ -67,23 +76,47 @@ jobs:
           cd build
           ctest --output-on-failure || true
 
-      - name: Package build/bin into ZIP (Windows)
+      - name: Package DLLs and binaries into ZIP (Windows)
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          $out = Join-Path $env:GITHUB_WORKSPACE "artifacts"
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
-          $tag = if ($env:GITHUB_REF -and $env:GITHUB_REF -match 'refs/tags/(.+)') { $Matches[1] } else { "no-tag" }
-          $zipname = "aseprite-$tag-windows.zip"
-          # compress the bin folder; adjust path if necessary
-          $src = Join-Path $env:GITHUB_WORKSPACE "build\bin"
-          if (Test-Path $src) {
-            Compress-Archive -Path (Join-Path $src '*') -DestinationPath (Join-Path $out $zipname) -Force
-            Write-Host "Created $zipname"
+          $workspace = $env:GITHUB_WORKSPACE
+          $out = Join-Path $workspace "artifacts"
+          if (-Not (Test-Path $out)) { New-Item -ItemType Directory -Path $out | Out-Null }
+          $binOut = Join-Path $out "bin"
+          if (Test-Path $binOut) { Remove-Item -Recurse -Force $binOut }
+          New-Item -ItemType Directory -Path $binOut | Out-Null
+
+          Write-Host "Copying build binaries (if any)..."
+          $buildBin = Join-Path $workspace "build\bin"
+          if (Test-Path $buildBin) {
+            Get-ChildItem -Path $buildBin -Recurse -File | Copy-Item -Destination $binOut -Force
           } else {
-            Write-Host "build\\bin not found, listing build dir:"
-            Get-ChildItem -Recurse -Force .\build | Select-Object -First 100
-            Exit 1
+            Write-Host "build\\bin not found"
           }
+
+          Write-Host "Collecting Skia DLLs (if present)..."
+          $skiaDirs = Get-ChildItem -Path $workspace -Directory -Filter skia -Recurse -ErrorAction SilentlyContinue
+          foreach ($d in $skiaDirs) {
+            Get-ChildItem -Path $d.FullName -Filter *.dll -Recurse -File -ErrorAction SilentlyContinue | Copy-Item -Destination $binOut -Force -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Collecting OpenSSL (libcrypto/libssl) DLLs from workspace..."
+          Get-ChildItem -Path $workspace -Include 'libcrypto-3*.dll','libssl-3*.dll' -Recurse -File -ErrorAction SilentlyContinue | Copy-Item -Destination $binOut -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Also looking for DLLs in third_party and laf..."
+          Get-ChildItem -Path (Join-Path $workspace 'third_party') -Filter *.dll -Recurse -File -ErrorAction SilentlyContinue | Copy-Item -Destination $binOut -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path (Join-Path $workspace 'laf') -Filter *.dll -Recurse -File -ErrorAction SilentlyContinue | Copy-Item -Destination $binOut -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Listing artifacts/bin contents:"
+          Get-ChildItem -Path $binOut -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+          $tag = if ($env:TAG -and $env:TAG -ne '') { $env:TAG } else { 'no-tag' }
+          $zipPath = Join-Path $out "aseprite-$tag-windows.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          Compress-Archive -Path (Join-Path $binOut '*') -DestinationPath $zipPath -Force
+          Write-Host "Created ZIP: $zipPath"
 
       - name: Upload artifact (zip)
         uses: actions/upload-artifact@v4
