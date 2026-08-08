@@ -1,0 +1,115 @@
+name: Build & Release — Windows
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - name: Setup MSVC toolchain (Visual Studio / MSVC)
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        uses: aseprite/get-ninja@main
+
+      - name: Install Skia (needed for GUI build)
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]] ; then
+            this_dir=$(cygpath "${{ github.workspace }}")
+          else
+            this_dir="${{ github.workspace }}"
+          fi
+          skia_url=$(source $this_dir/laf/misc/skia-url.sh | xargs)
+          skia_file=$(basename $skia_url)
+          curl --ssl-revoke-best-effort -L -o "$skia_file" "$skia_url"
+          unzip "$skia_file" -d skia
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          # On Windows we disable ccache and build with Skia backend
+          enable_ccache=off
+          laf_backend=skia
+          enable_scripting=on
+          skia_arch=x64
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_TESTS=ON \
+            -DENABLE_SCRIPTING=${enable_scripting} \
+            -DENABLE_CCACHE=${enable_ccache} \
+            -DLAF_BACKEND=${laf_backend} \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
+
+      - name: Build (Ninja)
+        shell: bash
+        run: |
+          cd build
+          ninja -j 2
+
+      - name: Run C++ tests
+        shell: bash
+        run: |
+          cd build
+          ctest --output-on-failure || true
+
+      - name: Package build/bin into ZIP (Windows)
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE "artifacts"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $tag = if ($env:GITHUB_REF -and $env:GITHUB_REF -match 'refs/tags/(.+)') { $Matches[1] } else { "no-tag" }
+          $zipname = "aseprite-$tag-windows.zip"
+          # compress the bin folder; adjust path if necessary
+          $src = Join-Path $env:GITHUB_WORKSPACE "build\bin"
+          if (Test-Path $src) {
+            Compress-Archive -Path (Join-Path $src '*') -DestinationPath (Join-Path $out $zipname) -Force
+            Write-Host "Created $zipname"
+          } else {
+            Write-Host "build\\bin not found, listing build dir:"
+            Get-ChildItem -Recurse -Force .\build | Select-Object -First 100
+            Exit 1
+          }
+
+      - name: Upload artifact (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-windows-zip
+          path: artifacts/
+
+      - name: Create GitHub Release (if triggered by tag)
+        id: create_release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Asset (if tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/aseprite-${{ github.ref_name }}-windows.zip
+          asset_name: aseprite-${{ github.ref_name }}-windows.zip
+          asset_content_type: application/zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
